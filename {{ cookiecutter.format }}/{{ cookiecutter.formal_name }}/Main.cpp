@@ -12,103 +12,192 @@ using namespace System::Diagnostics;
 using namespace System::IO;
 using namespace System::Windows::Forms;
 
+#define LOG_EXTENSION ".log"
 
-wchar_t* wstr(String^);
-void crash_dialog(String^);
-String^ format_traceback(PyObject *type, PyObject *value, PyObject *traceback);
+
+static wchar_t* wstr(String^);
+static String^ format_traceback(PyObject* type, PyObject* value, PyObject* traceback);
+
+ref class LogWriter
+{
+private:
+    String^ const filename;
+    StreamWriter^ writer;
+    FILE* file;
+    int stderr_fileno;
+
+public:
+    LogWriter(String^ const filename) : filename{ filename } {
+        writer = gcnew StreamWriter(filename);
+    }
+
+    void Write(String^ m) {
+        writer->Write(m);
+    }
+
+    void WriteLine(String^ m) {
+        writer->WriteLine(m);
+    }
+
+    void Flush(void) {
+        writer->Flush();
+    }
+
+    /** @brief Capture stderr to the logfile. */
+    void StartStdErrCapture(void) {
+        // close the log file
+        writer->Close();
+
+        // save original stderr
+        stderr_fileno = _dup(_fileno(stderr));
+
+        // reopen the log file as the stderr destination
+        FILE* _file = nullptr;
+        errno_t const err = _wfreopen_s(&_file, wstr(filename), L"a", stderr);
+        if (err != 0) {
+            Console::Write("stderr redirect failed with err " + err + "\n");
+            exit(-1);
+        }
+        else if (_file == nullptr) {
+            Console::Write("Python system log file handle is nullptr\n");
+            exit(-1);
+        }
+        int const fseek_err = fseek(_file, 0, SEEK_END);
+        if (fseek_err != 0) {
+            Console::Write("Failed to seek to end of file!\n");
+            exit(-1);
+        }
+        file = _file;
+    }
+
+    /** @brief Stop capturing stderr to the logfile. */
+    void StopStdErrCapture(void) {
+        // restore original stderr
+        int const dup2_err = _dup2(stderr_fileno, _fileno(stderr));
+        if (dup2_err != 0) {
+            Console::Write("Error resetting stderr!");
+            exit(-1);
+        }
+
+        // reopen the log file for logging
+        writer = gcnew StreamWriter(filename, true);
+    }
+};
+
+ref class CrashDialogWriter {
+public:
+    LogWriter^ const log;
+
+    CrashDialogWriter(LogWriter^ log) : log{ log } {}
+
+    /** @brief Write an error message to the log file and stdout, then flush the log file. */
+    void Write(String^ error_message) {
+        log->Write(error_message);
+        Console::Write(error_message);
+        log->Flush();
+    }
+};
+
+ref class ExitStatusExceptionHandler {
+private:
+    PyConfig * const config;
+    CrashDialogWriter^ const crash_dialog;
+    String^ const log_filename;
+
+public:
+    ExitStatusExceptionHandler(
+        PyConfig* config,
+        CrashDialogWriter^ const crash_dialog,
+        String^ const log_filename
+    ) 
+        : config{ config }
+        , crash_dialog{ crash_dialog } 
+        , log_filename{ log_filename }
+    {}
+
+    void Handle(String^ error_message, PyStatus const * status) {
+        crash_dialog->Write(error_message + "\n\t" + gcnew String(status->func) + ": " + gcnew String(status->err_msg) + "\n");
+        crash_dialog->Write("\tSee " + log_filename + "\n");
+        crash_dialog->log->StartStdErrCapture();
+        PyConfig_Clear(config);
+        Py_ExitStatusException(*status);
+    }
+};
 
 int Main(array<String^>^ args) {
     int ret = 0;
-    size_t size;
-    FileVersionInfo^ version_info;
-    String^ log_folder;
-    String^ src_log;
-    String^ dst_log;
-    FILE* log;
-    PyStatus status;
-    PyConfig config;
-    String^ python_home;
-    String^ app_module_name;
-    String^ path;
-    String^ traceback_str;
-    wchar_t *app_module_str;
-    PyObject *app_module;
-    PyObject *module;
-    PyObject *module_attr;
-    PyObject *method_args;
-    PyObject *result;
-    PyObject *exc_type;
-    PyObject *exc_value;
-    PyObject *exc_traceback;
-    PyObject *systemExit_code;
+
+    AttachConsole(ATTACH_PARENT_PROCESS);
 
     // Uninitialize the Windows threading model; allow apps to make
     // their own threading model decisions.
     CoUninitialize();
 
     // Get details of the app from app metadata
-    version_info = FileVersionInfo::GetVersionInfo(Application::ExecutablePath);
+    FileVersionInfo^ const version_info = FileVersionInfo::GetVersionInfo(Application::ExecutablePath);
 
-    // If we can attach to the console, then we're running in a terminal;
-    // we can use stdout and stderr as normal. However, if there's no
-    // console, we need to redirect stdout/err to a log file.
-    if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
-        log_folder = Environment::GetFolderPath(Environment::SpecialFolder::LocalApplicationData) + "\\" +
-            version_info->CompanyName + "\\" +
-            version_info->ProductName + "\\Logs";
-        if (!Directory::Exists(log_folder)) {
-            // If log folder doesn't exist, create it
-            Directory::CreateDirectory(log_folder);
-        } else {
-            // If it does, rotate the logs in that folder.
-            // - Delete <app name>-9.log
-            src_log = log_folder + "\\" + version_info->InternalName + "-9.log";
-            if (File::Exists(src_log)) {
-                File::Delete(src_log);
-            }
+    String^ const log_folder = Environment::GetFolderPath(Environment::SpecialFolder::LocalApplicationData) + "\\" +
+        version_info->CompanyName + "\\" +
+        version_info->ProductName + "\\Logs";
+    String^ const log_prefix = log_folder + "\\" + version_info->InternalName;
+    String^ const python_system_error_log_name = log_folder + "\\python_system_error.log";
+    String^ const current_log_name = log_prefix + LOG_EXTENSION;
 
-            // - Move <app name>-8.log -> <app name>-9.log
-            // - Move <app name>-7.log -> <app name>-8.log
-            // - ...
-            // - Move <app name>.log -> <app name>-2.log
-            for (int dst_index = 9; dst_index >= 2; dst_index--) {
-                if (dst_index == 2) {
-                    src_log = log_folder + "\\" + version_info->InternalName + ".log";
-                } else {
-                    src_log = log_folder + "\\" + version_info->InternalName + "-" + (dst_index - 1) + ".log";
-                }
-                dst_log = log_folder + "\\" + version_info->InternalName + "-" + dst_index + ".log";
+    if (!Directory::Exists(log_folder)) {
+        // If log folder doesn't exist, create it
+        Directory::CreateDirectory(log_folder);
+    } else {
+        // If it does, rotate the logs in that folder.
+        
+        // Delete the log at index 9 if it exists
+        String^ const evicted_log = log_prefix + "-9" + LOG_EXTENSION;
+        if (File::Exists(evicted_log)) {
+            File::Delete(evicted_log);
+        }
 
-                if (File::Exists(src_log)) {
-                    File::Move(src_log, dst_log);
-                }
+        // - Move <app name>-8.log -> <app name>-9.log
+        // - Move <app name>-7.log -> <app name>-8.log
+        // - ...
+        // - Move <app name>-2.log -> <app name>-3.log
+        for (int log_index = 8; log_index >= 2; log_index--) {
+            String^ const old_log_name = log_prefix + "-" + log_index + LOG_EXTENSION;
+            if (File::Exists(old_log_name)) {
+                File::Move(old_log_name, log_prefix + "-" + (log_index + 1) + LOG_EXTENSION);
             }
         }
 
-        // Redirect stdout to a log file <app name>.log, in the
-        // user's local Logs folder for the app.
-        // stderr doesn't exist when running without an attached console;
-        // sys.stderr will be None in the Python interpreter. This causes
-        // all error output to be written to stdout.
-        _wfreopen_s(&log, wstr(log_folder + "\\" + version_info->InternalName + ".log"), L"w", stdout);
+        // Move <app name>.log -> <app name>-2.log
+        if (File::Exists(current_log_name)) {
+            File::Move(current_log_name, log_prefix + "-2" + LOG_EXTENSION);
+        }
     }
 
-    printf("Log started: %S\n", wstr(DateTime::Now.ToString("yyyy-MM-dd HH:mm:ssZ")));
+    LogWriter^ const log = gcnew LogWriter(current_log_name);
+    CrashDialogWriter^ const crash_dialog = gcnew CrashDialogWriter(log);
+
+    log->WriteLine("Log started: " + DateTime::Now.ToString("yyyy-MM-dd HH:mm:ssZ"));
+
     // Preconfigure the Python interpreter;
     // This ensures the interpreter is in Isolated mode,
     // and is using UTF-8 encoding.
-    printf("PreInitializing Python runtime...\n");
+    log->WriteLine("PreInitializing Python runtime...");
     PyPreConfig pre_config;
     PyPreConfig_InitPythonConfig(&pre_config);
     pre_config.utf8_mode = 1;
     pre_config.isolated = 1;
-    status = Py_PreInitialize(&pre_config);
+
+    log->StartStdErrCapture();
+    PyStatus status = Py_PreInitialize(&pre_config);
+    log->StopStdErrCapture();
+
     if (PyStatus_Exception(status)) {
-        crash_dialog("Unable to pre-initialize Python runtime.");
+        crash_dialog->Write("Unable to pre-initialize Python runtime\n");
+        crash_dialog->Write("See " + current_log_name + "\n");
         Py_ExitStatusException(status);
     }
 
     // Pre-initialize Python configuration
+    PyConfig config;
     PyConfig_InitIsolatedConfig(&config);
 
     // Configure the Python interpreter:
@@ -120,103 +209,109 @@ int Main(array<String^>^ args) {
     // Isolated apps need to set the full PYTHONPATH manually.
     config.module_search_paths_set = 1;
 
+    ExitStatusExceptionHandler^ const py_exit_status = gcnew ExitStatusExceptionHandler(
+        &config, crash_dialog, current_log_name
+    );
+
     // Set the home for the Python interpreter
-    python_home = Application::StartupPath;
-    printf("PythonHome: %S\n", wstr(python_home));
+    String^ const python_home = Application::StartupPath;
+    log->WriteLine("PythonHome: " + python_home);
+    log->StartStdErrCapture();
     status = PyConfig_SetString(&config, &config.home, wstr(python_home));
+    log->StopStdErrCapture();
     if (PyStatus_Exception(status)) {
-        crash_dialog("Unable to set PYTHONHOME: " + gcnew String(status.err_msg));
-        PyConfig_Clear(&config);
-        Py_ExitStatusException(status);
+        py_exit_status->Handle("Unable to set PYTHONHOME:", &status);
     }
 
     // Determine the app module name. Look for the BRIEFCASE_MAIN_MODULE
     // environment variable first; if that exists, we're probably in test
     // mode. If it doesn't exist, fall back to the MainModule key in the
     // main bundle.
+    wchar_t* app_module_str;
+    size_t size;
     _wdupenv_s(&app_module_str, &size, L"BRIEFCASE_MAIN_MODULE");
+    String^ app_module_name;
     if (app_module_str) {
         app_module_name = gcnew String(app_module_str);
     } else {
         app_module_name = version_info->InternalName;
         app_module_str = wstr(app_module_name);
     }
+    log->StartStdErrCapture();
     status = PyConfig_SetString(&config, &config.run_module, app_module_str);
+    log->StopStdErrCapture();
     if (PyStatus_Exception(status)) {
-        crash_dialog("Unable to set app module name: " + gcnew String(status.err_msg));
-        PyConfig_Clear(&config);
-        Py_ExitStatusException(status);
+        py_exit_status->Handle("Unable to set app module name:", &status);
     }
 
     // Read the site config
+    log->StartStdErrCapture();
     status = PyConfig_Read(&config);
+    log->StopStdErrCapture();
     if (PyStatus_Exception(status)) {
-        crash_dialog("Unable to read site config: " + gcnew String(status.err_msg));
-        PyConfig_Clear(&config);
-        Py_ExitStatusException(status);
+        py_exit_status->Handle("Unable to read site config:", &status);
     }
 
     // Set the full module path. This includes the stdlib, site-packages, and app code.
-    printf("PYTHONPATH:\n");
+    log->WriteLine("PYTHONPATH:");
     // The .zip form of the stdlib
-    path = python_home + "\\python{{ cookiecutter.python_version|py_libtag }}.zip";
-    printf("- %S\n", wstr(path));
+    String^ path = python_home + "\\python312.zip";
+    log->WriteLine("- " + path);
+    log->StartStdErrCapture();
     status = PyWideStringList_Append(&config.module_search_paths, wstr(path));
+    log->StopStdErrCapture();
     if (PyStatus_Exception(status)) {
-        crash_dialog("Unable to set .zip form of stdlib path: " + gcnew String(status.err_msg));
-        PyConfig_Clear(&config);
-        Py_ExitStatusException(status);
+        py_exit_status->Handle("Unable to set .zip form of stdlib path:", &status);
     }
 
     // The unpacked form of the stdlib
-    path = python_home;
-    printf("- %S\n", wstr(path));
-    status = PyWideStringList_Append(&config.module_search_paths, wstr(path));
+    log->WriteLine("- " + python_home);
+    log->StartStdErrCapture();
+    status = PyWideStringList_Append(&config.module_search_paths, wstr(python_home));
+    log->StopStdErrCapture();
     if (PyStatus_Exception(status)) {
-        crash_dialog("Unable to set unpacked form of stdlib path: " + gcnew String(status.err_msg));
-        PyConfig_Clear(&config);
-        Py_ExitStatusException(status);
+        py_exit_status->Handle("Unable to set unpacked form of stdlib path:", &status);
     }
 
     // Add the app_packages path
     path = System::Windows::Forms::Application::StartupPath + "\\app_packages";
-    printf("- %S\n", wstr(path));
+    log->WriteLine("- " + path);
+    log->StartStdErrCapture();
     status = PyWideStringList_Append(&config.module_search_paths, wstr(path));
+    log->StopStdErrCapture();
     if (PyStatus_Exception(status)) {
-        crash_dialog("Unable to set app packages path: " + gcnew String(status.err_msg));
-        PyConfig_Clear(&config);
-        Py_ExitStatusException(status);
+        py_exit_status->Handle("Unable to set app packages path:", &status);
     }
 
     // Add the app path
     path = System::Windows::Forms::Application::StartupPath + "\\app";
-    printf("- %S\n", wstr(path));
+    log->WriteLine("- " + path);
+    log->StartStdErrCapture();
     status = PyWideStringList_Append(&config.module_search_paths, wstr(path));
+    log->StopStdErrCapture();
     if (PyStatus_Exception(status)) {
-        crash_dialog("Unable to set app path: " + gcnew String(status.err_msg));
-        PyConfig_Clear(&config);
-        Py_ExitStatusException(status);
+        py_exit_status->Handle("Unable to set app path:", &status);
     }
 
-    printf("Configure argc/argv...\n");
+    log->WriteLine("Configure argc/argv...");
     wchar_t** argv = new wchar_t* [args->Length + 1];
     argv[0] = wstr(Application::ExecutablePath);
     for (int i = 0; i < args->Length; i++) {
         argv[i + 1] = wstr(args[i]);
     }
+    log->StartStdErrCapture();
     status = PyConfig_SetArgv(&config, args->Length + 1, argv);
+    log->StopStdErrCapture();
     if (PyStatus_Exception(status)) {
-        crash_dialog("Unable to configure argc/argv: " + gcnew String(status.err_msg));
-        PyConfig_Clear(&config);
-        Py_ExitStatusException(status);
+        py_exit_status->Handle("Unable to configure argc/argv:", &status);
     }
 
-    printf("Initializing Python runtime...\n");
+    log->WriteLine("Initializing Python runtime...");
+    log->StartStdErrCapture();
     status = Py_InitializeFromConfig(&config);
+    log->StopStdErrCapture();
     if (PyStatus_Exception(status)) {
-        crash_dialog("Unable to initialize Python interpreter: " + gcnew String(status.err_msg));
-        PyConfig_Clear(&config);
-        Py_ExitStatusException(status);
+        py_exit_status->Handle("Unable to initialize Python interpreter:", &status);
     }
 
     try {
@@ -227,116 +322,101 @@ int Main(array<String^>^ args) {
         // pymain_run_module() method); we need to re-implement it
         // because we need to be able to inspect the error state of
         // the interpreter, not just the return code of the module.
-        printf("Running app module: %S\n", app_module_str);
+        log->WriteLine("Running app module: " + app_module_name);
 
-        module = PyImport_ImportModule("runpy");
+        PyObject* const module = PyImport_ImportModule("runpy");
         if (module == NULL) {
-            crash_dialog("Could not import runpy module");
+            crash_dialog->Write("Could not import runpy module");
             exit(-2);
         }
 
-        module_attr = PyObject_GetAttrString(module, "_run_module_as_main");
+        PyObject* const module_attr = PyObject_GetAttrString(module, "_run_module_as_main");
         if (module_attr == NULL) {
-            crash_dialog("Could not access runpy._run_module_as_main");
+            crash_dialog->Write("Could not access runpy._run_module_as_main");
             exit(-3);
         }
 
-        app_module = PyUnicode_FromWideChar(app_module_str, wcslen(app_module_str));
+        PyObject* const app_module = PyUnicode_FromWideChar(app_module_str, wcslen(app_module_str));
         if (app_module == NULL) {
-            crash_dialog("Could not convert module name to unicode");
+            crash_dialog->Write("Could not convert module name to unicode");
             exit(-3);
         }
 
-        method_args = Py_BuildValue("(Oi)", app_module, 0);
+        PyObject* const method_args = Py_BuildValue("(Oi)", app_module, 0);
         if (method_args == NULL) {
-            crash_dialog("Could not create arguments for runpy._run_module_as_main");
+            crash_dialog->Write("Could not create arguments for runpy._run_module_as_main");
             exit(-4);
         }
 
         // Print a separator to differentiate Python startup logs from app logs,
-        // then flush stdout/stderr to ensure all startup logs have been output.
-        printf("---------------------------------------------------------------------------\n");
+        // then flush the log and stdout/stderr to ensure all startup logs have been output.
+        log->Write("---------------------------------------------------------------------------\n");
+        log->Flush();
         fflush(stdout);
         fflush(stderr);
 
         // Invoke the app module
-        result = PyObject_Call(module_attr, method_args, NULL);
+        PyObject const * const result = PyObject_Call(module_attr, method_args, NULL);
+
+        // Print a separator to differentiate app logs from exit logs,
+        // then flush the log and stdout/stderr to ensure all logs have been output.
+        log->Write("---------------------------------------------------------------------------\n");
+        log->Flush();
+        fflush(stdout);
+        fflush(stderr);
 
         if (result == NULL) {
             // Retrieve the current error state of the interpreter.
+            PyObject* exc_type;
+            PyObject* exc_value;
+            PyObject* exc_traceback;
             PyErr_Fetch(&exc_type, &exc_value, &exc_traceback);
             PyErr_NormalizeException(&exc_type, &exc_value, &exc_traceback);
 
             if (exc_traceback == NULL) {
-                crash_dialog("Could not retrieve traceback");
+                crash_dialog->Write("Could not retrieve traceback");
                 exit(-5);
             }
 
             if (PyErr_GivenExceptionMatches(exc_value, PyExc_SystemExit)) {
-                systemExit_code = PyObject_GetAttrString(exc_value, "code");
+                PyObject* systemExit_code = PyObject_GetAttrString(exc_value, "code");
                 if (systemExit_code == NULL) {
-                    printf("Could not determine exit code\n");
+                    crash_dialog->Write("Could not determine exit code, setting to -10\n");
                     ret = -10;
-                }
-                else {
-                    ret = (int) PyLong_AsLong(systemExit_code);
+                } else {
+                    ret = (int)PyLong_AsLong(systemExit_code);
                 }
             } else {
                 ret = -6;
             }
 
+            log->Write("Application will quit with exit code " + ret + "\n");
+
             if (ret != 0) {
                 // Display stack trace in the crash dialog.
-                traceback_str = format_traceback(exc_type, exc_value, exc_traceback);
-                printf("Application quit abnormally (Exit code %d)!\n", ret);
+                crash_dialog->Write(format_traceback(exc_type, exc_value, exc_traceback));
 
                 // Restore the error state of the interpreter.
                 PyErr_Restore(exc_type, exc_value, exc_traceback);
 
-                // Print exception to stderr.
-                // In case of SystemExit, this will call exit()
-                PyErr_Print();
-
-                // Display stack trace in the crash dialog.
-                crash_dialog(traceback_str);
+                // Exit here so that Py_Finalize() does not also print the traceback
                 exit(ret);
             }
         }
     }
     catch (Exception^ exception) {
-        crash_dialog("Python runtime error: " + exception);
+        crash_dialog->Write("Python runtime error: " + exception->ToString());
         ret = -7;
     }
-    Py_Finalize();
 
+    Py_Finalize();
     return ret;
 }
 
-wchar_t *wstr(String^ str)
+static inline wchar_t* wstr(String^ str)
 {
     pin_ptr<const wchar_t> pinned = PtrToStringChars(str);
-    return (wchar_t*)pinned;
-}
-
-/**
- * Construct and display a modal dialog to the user that contains
- * details of an error during application execution (usually a traceback).
- */
-void crash_dialog(System::String^ details) {
-    wchar_t *app_module_str;
-    size_t size;
-    // Write the error to the log
-    printf("%S\n", wstr(details));
-
-    // If there's an app module override, we're running in test mode; don't show error dialogs
-    _wdupenv_s(&app_module_str, &size, L"BRIEFCASE_MAIN_MODULE");
-    if (app_module_str) {
-        return;
-    }
-    Briefcase::CrashDialog^ form;
-
-    form = gcnew Briefcase::CrashDialog(details);
-    form->ShowDialog();
+    return (wchar_t *) pinned;
 }
 
 /**
@@ -346,44 +426,35 @@ void crash_dialog(System::String^ details) {
  * If any error occurs processing the traceback, the error message returned
  * will describe the mode of failure.
  */
-String^ format_traceback(PyObject *type, PyObject *value, PyObject *traceback) {
-    String ^traceback_str;
-    PyObject *traceback_list;
-    PyObject *traceback_module;
-    PyObject *format_exception;
-    PyObject *traceback_unicode;
-    PyObject *inner_traceback;
-
+static String^ format_traceback(PyObject* type, PyObject* value, PyObject* traceback) {
     // Drop the top two stack frames; these are internal
     // wrapper logic, and not in the control of the user.
     for (int i = 0; i < 2; i++) {
-        inner_traceback = PyObject_GetAttrString(traceback, "tb_next");
+        PyObject* inner_traceback = PyObject_GetAttrString(traceback, "tb_next");
         if (inner_traceback != NULL) {
             traceback = inner_traceback;
         }
     }
 
     // Format the traceback.
-    traceback_module = PyImport_ImportModule("traceback");
+    PyObject* traceback_module = PyImport_ImportModule("traceback");
     if (traceback_module == NULL) {
-        printf("Could not import traceback.\n");
         return "Could not import traceback";
     }
 
-    format_exception = PyObject_GetAttrString(traceback_module, "format_exception");
+    PyObject* format_exception = PyObject_GetAttrString(traceback_module, "format_exception");
+    PyObject* traceback_list = nullptr;
     if (format_exception && PyCallable_Check(format_exception)) {
         traceback_list = PyObject_CallFunctionObjArgs(format_exception, type, value, traceback, NULL);
     } else {
-        printf("Could not find 'format_exception' in 'traceback' module.\n");
         return "Could not find 'format_exception' in 'traceback' module.";
     }
     if (traceback_list == NULL) {
-        printf("Could not format traceback.\n");
         return "Could not format traceback.";
     }
 
     // Concatenate all the lines of the traceback into a single string
-    traceback_unicode = PyUnicode_Join(PyUnicode_FromString(""), traceback_list);
+    PyObject* traceback_unicode = PyUnicode_Join(PyUnicode_FromString(""), traceback_list);
 
     // Convert the Python Unicode string into a UTF-16 Windows String.
     // It's easiest to do this by using the Python API to encode to UTF-8,
@@ -392,10 +463,8 @@ String^ format_traceback(PyObject *type, PyObject *value, PyObject *traceback) {
     const char* bytes = PyUnicode_AsUTF8AndSize(PyObject_Str(traceback_unicode), &size);
 
     System::Text::UTF8Encoding^ utf8 = gcnew System::Text::UTF8Encoding;
-    traceback_str = gcnew String(utf8->GetString((Byte *)bytes, (int) size));
+    String^ traceback_str = gcnew String(utf8->GetString((Byte*)bytes, (int)size));
 
     // Clean up the traceback string, removing references to the installed app location
-    traceback_str = traceback_str->Replace(Application::StartupPath, "");
-
-    return traceback_str;
+    return traceback_str->Replace(Application::StartupPath, "");
 }
